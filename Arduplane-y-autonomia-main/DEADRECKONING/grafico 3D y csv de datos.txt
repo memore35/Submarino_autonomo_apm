@@ -1,0 +1,300 @@
+import time, math, csv, os
+from pymavlink import mavutil
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa
+
+# ============== CONFIG GENERAL ==============
+SERIAL_PORT = "COM3"
+BAUD        = 115200
+
+# Waypoints 3D (N, E, D) en metros
+# D positivo hacia abajo (convención NED)
+WAYPOINTS = [
+    (0.0, 0.0, 0.0),
+    (4.0, 0.0, 1.0),
+    (4.0, 4.0, 1.5),
+    (0.0, 4.0, 0.5),
+    (0.0, 0.0, 0.0),
+]
+
+WP_RADIUS_M = 0.30
+LOOP_DT     = 0.05
+
+# Mapeo throttle → velocidad (ajústalo a tu estanque real)
+THR_IDLE    = 1200
+THR_CRUISE  = 1750
+THR_FULL    = 2000
+SPEED_FULL  = 0.10
+MIN_THR     = 1300
+SLOW_DIST   = 1.0
+
+# Control de Yaw (rumbo horizontal)
+YAW_KP       = 20.0
+YAW_MAX_DEG  = 35.0
+# Control de Pitch (profundidad)
+PITCH_KP     = 6.0
+PITCH_MAX_DEG = 25.0
+
+PWM_MIN, PWM_MAX = 1000, 2000
+
+# Hold de roll (opcional)
+USE_ROLL_HOLD = True
+R_KP, R_KI, R_KD = 3.0, 0.0, 0.0
+ROLL_TARGET_DEG = 0.0
+
+# Trims seguros
+TRIM = {"roll":1500, "pitch":1500, "yaw":1500, "thr":1500}
+
+# Filtro yaw (complementario)
+ALPHA_COMP = 0.02
+ZUPT_GYRO  = 0.05
+
+# Log a CSV (tu original)
+LOG_TO_CSV = True
+CSV_PATH   = "dr_log_3D.csv"
+
+# === CSV extra para los dos gráficos que pediste ===
+CSV_PATH_PLOTS = "dr_depth_pitch.csv"
+csv_file_plots = None
+csv_writer_plots = None
+
+# ============== UTILIDADES ==============
+def wrap_deg(a: float) -> float:
+    return (a + 180.0) % 360.0 - 180.0
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def send_rc(master, roll=1500, pitch=1500, throttle=1500, yaw=1500):
+    master.mav.rc_channels_override_send(
+        master.target_system, master.target_component,
+        int(roll), int(pitch), int(throttle), int(yaw),
+        0, 0, 0, 0
+    )
+
+def bearing_deg(fromN, fromE, toN, toE):
+    dN, dE = (toN - fromN), (toE - fromE)
+    hdg = math.degrees(math.atan2(dE, dN))
+    if hdg < 0: hdg += 360.0
+    return hdg
+
+def speed_from_throttle(thr_pwm:int) -> float:
+    if thr_pwm <= THR_IDLE: return 0.0
+    if thr_pwm >= THR_FULL: return SPEED_FULL
+    f = (thr_pwm - THR_IDLE) / float(THR_FULL - THR_IDLE)
+    return f * SPEED_FULL
+
+# ============== CONEXIÓN MAVLINK ==============
+print(f"[INFO] Conectando a {SERIAL_PORT} baud {BAUD} ...")
+master = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD)
+print("[INFO] Esperando heartbeat del APM...")
+master.wait_heartbeat()
+print(f"[INFO] Conectado (sys {master.target_system}, comp {master.target_component})")
+
+# Neutral al inicio
+send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+time.sleep(0.3)
+
+# ============== FIGURAS ==============
+plt.ion()
+fig = plt.figure(figsize=(9,5))
+ax3d = fig.add_subplot(1,2,1, projection='3d')
+ax3d.set_xlabel("E (m)"); ax3d.set_ylabel("N (m)"); ax3d.set_zlabel("D (m)")
+ax3d.grid(True)
+ax3d.set_box_aspect((1,1,0.6))
+
+wps_N, wps_E, wps_D = zip(*WAYPOINTS)
+ax3d.plot(wps_E, wps_N, wps_D, "k--", lw=1)
+ax3d.scatter(wps_E, wps_N, wps_D, marker="o", s=30)
+
+traj3d, = ax3d.plot([0],[0],[0], "-", lw=2)
+cur3d  = ax3d.scatter([0],[0],[0], s=30, c="r")
+
+axZ = fig.add_subplot(1,2,2)
+axZ.set_xlabel("t (s)"); axZ.set_ylabel("D (m, +abajo)")
+axZ.grid(True)
+lineZ, = axZ.plot([0],[0], "-")
+
+# ============== ESTADO DR ==============
+N, E, D = 0.0, 0.0, 0.0
+psi_est = None
+roll_i = 0.0
+roll_prev_err = 0.0
+wp_index = 0
+t0 = time.time()
+t_prev = t0
+path_N, path_E, path_D, path_t = [N], [E], [D], [0.0]
+
+# CSV (tu original)
+csv_file = None
+csv_writer = None
+if LOG_TO_CSV:
+    csv_file = open(CSV_PATH, "w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["t", "N", "E", "D", "dist3D", "yaw_comp_deg", "yaw_filt_deg",
+                         "roll_deg", "pitch_deg", "p", "q", "r", "thr_pwm", "yaw_pwm", "pitch_pwm", "wp_idx"])
+
+# CSV extra (nuevo)
+csv_file_plots = open(CSV_PATH_PLOTS, "w", newline="", encoding="utf-8")
+csv_writer_plots = csv.writer(csv_file_plots)
+csv_writer_plots.writerow(["t_s", "D", "pitch_deg"])  # justo lo necesario
+
+print("[INFO] Iniciando misión 3D DR… (Ctrl+C para salir)")
+
+try:
+    while wp_index < len(WAYPOINTS):
+
+        t_now = time.time()
+        dt = t_now - t_prev
+        if dt <= 0.0: dt = LOOP_DT
+        t_prev = t_now
+        t_rel = t_now - t0
+
+        msg = master.recv_match(type="ATTITUDE", blocking=True, timeout=1.0)
+        if not msg:
+            send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+            continue
+
+        roll_deg   = math.degrees(float(msg.roll))
+        pitch_deg  = math.degrees(float(msg.pitch))
+        yaw_comp   = math.degrees(float(msg.yaw))
+        yaw_comp   = yaw_comp if yaw_comp >= 0 else yaw_comp + 360.0
+        p, q, r = float(msg.rollspeed), float(msg.pitchspeed), float(msg.yawspeed)
+
+        # Filtro complementario Yaw
+        psi_comp = math.radians(yaw_comp)
+        if psi_est is None:
+            psi_est = psi_comp
+        else:
+            psi_est = (psi_est + r*dt + math.pi) % (2*math.pi) - math.pi
+            cx_e, sy_e = math.cos(psi_est), math.sin(psi_est)
+            cx_c, sy_c = math.cos(psi_comp), math.sin(psi_comp)
+            cx = (1-ALPHA_COMP)*cx_e + ALPHA_COMP*cx_c
+            sy = (1-ALPHA_COMP)*sy_e + ALPHA_COMP*sy_c
+            norm = math.hypot(cx, sy)
+            if norm > 1e-6:
+                psi_est = math.atan2(sy/norm, cx/norm)
+        yaw_deg_filt = math.degrees(psi_est)%360
+
+        # === Cálculo de rumbo y profundidad deseados ===
+        targetN, targetE, targetD = WAYPOINTS[wp_index]
+        dist_h = math.hypot(targetN - N, targetE - E)
+        dist_z = (targetD - D)
+        dist3D = math.sqrt(dist_h**2 + dist_z**2)
+        hdg_des = bearing_deg(N, E, targetN, targetE)
+        err_yaw = wrap_deg(hdg_des - yaw_deg_filt)
+        err_yaw_clip = clamp(err_yaw, -YAW_MAX_DEG, YAW_MAX_DEG)
+
+        # Error de pitch (profundidad)
+        pitch_target_deg = clamp(math.degrees(math.atan2(dist_z, dist_h)), -PITCH_MAX_DEG, PITCH_MAX_DEG)
+        err_pitch = wrap_deg(pitch_target_deg - pitch_deg)
+        err_pitch_clip = clamp(err_pitch, -PITCH_MAX_DEG, PITCH_MAX_DEG)
+
+        # === Llegada a WP ===
+        if dist3D <= WP_RADIUS_M:
+            print(f"[MISSION] Waypoint {wp_index} alcanzado (dist={dist3D:.2f} m)")
+            wp_index += 1
+            send_rc(master, TRIM["roll"], TRIM["pitch"], 1200, TRIM["yaw"])
+            time.sleep(0.3)
+            continue
+
+        # === Control de Yaw y Pitch ===
+        yaw_pwm = int(TRIM["yaw"] + YAW_KP * err_yaw_clip)
+        yaw_pwm = clamp(yaw_pwm, PWM_MIN, PWM_MAX)
+
+        pitch_pwm = int(TRIM["pitch"] + PITCH_KP * err_pitch_clip)
+        pitch_pwm = clamp(pitch_pwm, PWM_MIN, PWM_MAX)
+
+        # === Throttle ===
+        thr_pwm = THR_CRUISE
+        if dist3D < SLOW_DIST:
+            frac = max(0.1, dist3D / SLOW_DIST)
+            thr_pwm = int(MIN_THR + frac * (THR_CRUISE - MIN_THR))
+
+        thr_pwm = clamp(thr_pwm, PWM_MIN, PWM_MAX)
+
+        # === Roll hold ===
+        if USE_ROLL_HOLD:
+            err_r = ROLL_TARGET_DEG - roll_deg
+            roll_i = clamp(roll_i + err_r*dt, -50, 50)
+            d_r = (err_r - roll_prev_err)/dt if dt > 0 else 0.0
+            roll_prev_err = err_r
+            roll_pwm = int(TRIM["roll"] + R_KP*err_r + R_KI*roll_i + R_KD*d_r)
+            roll_pwm = clamp(roll_pwm, PWM_MIN, PWM_MAX)
+        else:
+            roll_pwm = TRIM["roll"]
+
+        # === Enviar RC ===
+        send_rc(master, roll_pwm, pitch_pwm, thr_pwm, yaw_pwm)
+
+        # === Dead Reckoning 3D ===
+        v = speed_from_throttle(thr_pwm)
+        psi = psi_est
+        the = math.radians(pitch_deg)
+        v_h = v * math.cos(the)
+        v_z = v * math.sin(the)
+        dN = v_h * dt * math.cos(psi)
+        dE = v_h * dt * math.sin(psi)
+        dD = v_z * dt
+        N += dN; E += dE; D += dD
+
+        # === Log consola ===
+        print(f"[CTL] wp#{wp_index} N={N:.2f} E={E:.2f} D={D:.2f} "
+              f"dist3D={dist3D:.2f} yaw={yaw_deg_filt:.1f}->{hdg_des:.1f} "
+              f"pitch={pitch_deg:.1f}->{pitch_target_deg:.1f} "
+              f"errY={err_yaw:.1f} errP={err_pitch:.1f} PWM yaw={yaw_pwm} pitch={pitch_pwm} thr={thr_pwm}", end="\r")
+
+        # === Log CSV (tu original) ===
+        if csv_writer:
+            csv_writer.writerow([t_now, N, E, D, dist3D, yaw_comp, yaw_deg_filt,
+                                 roll_deg, pitch_deg, p, q, r, thr_pwm, yaw_pwm, pitch_pwm, wp_index])
+
+        # === CSV extra para gráficos (nuevo) ===
+        if csv_writer_plots:
+            csv_writer_plots.writerow([round(t_rel, 6), D, pitch_deg])
+            # flush para que veas datos mientras corre
+            csv_file_plots.flush()
+
+        # === Actualizar gráficos ===
+        path_N.append(N); path_E.append(E); path_D.append(D); path_t.append(t_rel)
+
+        traj3d.set_data(path_E, path_N)
+        traj3d.set_3d_properties(path_D)
+        cur3d.remove()
+        cur3d = ax3d.scatter([E], [N], [D], s=30, c="r")
+
+        ax3d.set_xlim(min(path_E)-1, max(path_E)+1)
+        ax3d.set_ylim(min(path_N)-1, max(path_N)+1)
+        ax3d.set_zlim(min(path_D)-0.5, max(path_D)+0.5)
+
+        lineZ.set_data(path_t, path_D)
+        axZ.relim(); axZ.autoscale_view()
+
+        plt.pause(0.001)
+        time.sleep(LOOP_DT)
+
+    print("\n[MISSION] Ruta completada.")
+    send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+
+except KeyboardInterrupt:
+    print("\n[INFO] Interrumpido por usuario.")
+finally:
+    try:
+        send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+    except Exception:
+        pass
+    if csv_file:
+        csv_file.close()
+        print(f"\n[INFO] Log guardado en: {os.path.abspath(CSV_PATH)}")
+    # Cierre del CSV extra (nuevo)
+    if csv_file_plots:
+        try:
+            csv_file_plots.flush()
+            os.fsync(csv_file_plots.fileno())
+        except Exception:
+            pass
+        csv_file_plots.close()
+        print(f"[INFO] Log para gráficos: {os.path.abspath(CSV_PATH_PLOTS)}")
+    plt.ioff(); plt.show()

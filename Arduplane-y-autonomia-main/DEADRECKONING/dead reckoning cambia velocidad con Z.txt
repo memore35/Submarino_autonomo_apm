@@ -1,0 +1,262 @@
+import time, math, csv, os
+from pymavlink import mavutil
+import matplotlib
+matplotlib.use("TkAgg")  # en Windows suele ir bien; si no, prueba Qt5Agg
+import matplotlib.pyplot as plt
+
+# ============== CONFIG GENERAL ==============
+SERIAL_PORT = "COM3"        # <-- cámbialo si tu APM aparece en otro COM
+BAUD        = 115200
+
+# Waypoints en sistema local N-E (metros) respecto al origen (0,0):
+WAYPOINTS = [
+    (0.0, 0.0),
+    (4.0, 0.0),
+    (4.0, 4.0),
+    (0.0, 4.0),
+    (0.0, 0.0),
+]
+
+WP_RADIUS_M = 0.30          # radio de aceptación (m)
+LOOP_DT     = 0.05          # ciclo de control (s)
+
+# Mapeo throttle → velocidad (calibra en tu estanque/patio)
+THR_IDLE    = 1200          # por debajo = parado
+THR_CRUISE  = 1750          # valor de crucero "nominal"
+THR_FULL    = 1700          # (puedes > THR_CRUISE si quieres)
+SPEED_FULL  = 0.40          # m/s medidos a THR_FULL (ajústalo)
+MIN_THR     = 1300          # mínimo de avance al acercarse
+SLOW_DIST   = 1.0           # empezar a desacelerar a esta distancia (m)
+
+# Control de rumbo (P)
+YAW_KP       = 5.5          # PWM por grado aprox
+YAW_MAX_DEG  = 35.0         # saturación del error angular (deg)
+PWM_MIN, PWM_MAX = 0, 3000
+
+# Hold de roll (opcional). Si no tienes superficies para roll, déjalo TRIM.
+USE_ROLL_HOLD = True
+R_KP, R_KI, R_KD = 3.0, 0.0, 0.0
+ROLL_TARGET_DEG = 0.0
+
+# Trims seguros
+TRIM = {"roll":1500, "pitch":1500, "yaw":1500, "thr":1500}
+
+# Filtro complementario yaw (gyro + brújula)
+ALPHA_COMP = 0.02           # 0.01–0.05 (más alto = más peso brújula)
+ZUPT_GYRO  = 0.05           # rad/s umbral para considerar "quieto"
+
+# Log a CSV
+LOG_TO_CSV = True
+CSV_PATH   = "dr_log.csv"
+
+# ============== UTILIDADES ==============
+def wrap_deg(a: float) -> float:
+    """Devuelve ángulo a [-180, 180)."""
+    return (a + 180.0) % 360.0 - 180.0
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def send_rc(master, roll=1500, pitch=1500, throttle=1500, yaw=1500):
+    """Envia señales PWM a los servos de control. Asegúrate de que los canales estén correctos."""
+    master.mav.rc_channels_override_send(
+        master.target_system, master.target_component,
+        int(roll), int(pitch), int(throttle), int(yaw),
+        0, 0, 0, 0
+    )
+
+def bearing_deg(fromN, fromE, toN, toE):
+    """Rumbo (deg) 0°=N, 90°=E en sistema N-E."""
+    dN, dE = (toN - fromN), (toE - fromE)
+    hdg = math.degrees(math.atan2(dE, dN))  # N->E
+    if hdg < 0: hdg += 360.0
+    return hdg
+
+def speed_from_throttle(thr_pwm:int) -> float:
+    """Interpolación lineal simple THR_IDLE→THR_FULL."""
+    if thr_pwm <= THR_IDLE:
+        return 0.0
+    if thr_pwm >= THR_FULL:
+        return SPEED_FULL
+    f = (thr_pwm - THR_IDLE) / float(THR_FULL - THR_IDLE)
+    return f * SPEED_FULL
+
+# ============== CONEXIÓN MAVLINK ==============
+print(f"[INFO] Conectando a {SERIAL_PORT} baud {BAUD} ...")
+master = mavutil.mavlink_connection(SERIAL_PORT, baud=BAUD)
+print("[INFO] Esperando heartbeat del APM...")
+master.wait_heartbeat()
+print(f"[INFO] Conectado (sys {master.target_system}, comp {master.target_component})")
+
+# Neutral al inicio (motor al mínimo de seguridad)
+send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+time.sleep(0.3)
+
+# ============== FIGURA (MAPA) ==============
+plt.ion()
+fig, ax = plt.subplots(figsize=(3.5, 6.0))
+ax.set_xlabel("E (m)"); ax.set_ylabel("N (m)")
+ax.grid(True)
+ax.set_xlim(-2, 6); ax.set_ylim(-2, 6)
+
+# Waypoints
+for (n, e) in WAYPOINTS:
+    ax.plot(e, n, "k--", marker="o", mfc="none")
+path_line, = ax.plot([0], [0], "-", lw=2)
+pos_marker, = ax.plot([0], [0], "o")
+
+# ============== ESTADO DR ==============
+N, E = 0.0, 0.0        # posición local
+psi_est = None         # heading estimado (rad)
+roll_i = 0.0
+roll_prev_err = 0.0
+wp_index = 0
+t_prev = time.time()
+path_N, path_E = [N], [E]
+
+# CSV
+csv_file = None
+csv_writer = None
+if LOG_TO_CSV:
+    csv_file = open(CSV_PATH, "w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["t", "N", "E", "dist", "yaw_comp_deg", "yaw_filt_deg",
+                         "roll_deg", "pitch_deg", "p(rad/s)", "q(rad/s)", "r(rad/s)",
+                         "thr_pwm", "yaw_pwm", "wp_idx"])
+
+print("[INFO] Iniciando misión DR… (Ctrl+C para salir)")
+
+try:
+    while wp_index < len(WAYPOINTS):
+
+        # ==== TIEMPO ====
+        t_now = time.time()
+        dt = t_now - t_prev
+        if dt <= 0.0: dt = LOOP_DT
+        t_prev = t_now
+
+        # ==== LECTURA ATTITUDE ====
+        msg = master.recv_match(type="ATTITUDE", blocking=True, timeout=1.0)
+        if not msg:
+            send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+            continue
+
+        roll_deg   = math.degrees(float(msg.roll))
+        pitch_deg  = math.degrees(float(msg.pitch))
+        yaw_comp   = math.degrees(float(msg.yaw))      # brújula (APM)
+        yaw_comp   = yaw_comp if yaw_comp >= 0 else yaw_comp + 360.0
+        p = float(msg.rollspeed)   # rad/s
+        q = float(msg.pitchspeed)  # rad/s
+        r = float(msg.yawspeed)    # rad/s
+
+        # ==== FILTRO COMPLEMENTARIO YAW ====
+        psi_comp = math.radians(yaw_comp)
+        if psi_est is None:
+            psi_est = psi_comp
+        else:
+            # integración con gyro + normalización
+            psi_est = (psi_est + r*dt + math.pi) % (2*math.pi) - math.pi
+            # corrección suave con brújula en espacio unitario (evita salto 359→0)
+            cx_e, sy_e = math.cos(psi_est), math.sin(psi_est)
+            cx_c, sy_c = math.cos(psi_comp), math.sin(psi_comp)
+            cx = (1-ALPHA_COMP)*cx_e + ALPHA_COMP*cx_c
+            sy = (1-ALPHA_COMP)*sy_e + ALPHA_COMP*sy_c
+            norm = math.hypot(cx, sy)
+            if norm > 1e-6:
+                cx /= norm; sy /= norm
+                psi_est = math.atan2(sy, cx)
+
+        yaw_deg_filt = math.degrees(psi_est) if psi_est >= 0 else math.degrees(psi_est) + 360.0
+
+        # ==== WP ACTUAL, DISTANCIA Y HEADING DESEADO ====
+        targetN, targetE = WAYPOINTS[wp_index]
+        dist = math.hypot(targetN - N, targetE - E)
+        hdg_des = bearing_deg(N, E, targetN, targetE)
+        err_deg = wrap_deg(hdg_des - yaw_deg_filt)
+        err_clip = clamp(err_deg, -YAW_MAX_DEG, YAW_MAX_DEG)
+
+        # ==== LLEGADA A WP ====
+        if dist <= WP_RADIUS_M:
+            print(f"[MISSION] Waypoint {wp_index} alcanzado (dist={dist:.2f} m)")
+            wp_index += 1
+            send_rc(master, TRIM["roll"], TRIM["pitch"], 1200, TRIM["yaw"])
+            time.sleep(0.3)
+            continue
+
+        # ==== CONTROL DE RUMBO (P) ====
+        yaw_pwm = int(TRIM["yaw"] + YAW_KP * err_clip)
+        yaw_pwm = clamp(yaw_pwm, PWM_MIN, PWM_MAX)
+
+        # ==== RAMPA DE THROTTLE según distancia ====
+        if dist < SLOW_DIST:
+            frac = max(0.1, dist / SLOW_DIST)   # 0.1–1.0
+            thr_pwm = int(MIN_THR + frac * (THR_CRUISE - MIN_THR))
+        else:
+            thr_pwm = THR_CRUISE
+        thr_pwm = clamp(thr_pwm, PWM_MIN, PWM_MAX)
+
+        # ==== HOLD DE ROLL (opcional) ====
+        if USE_ROLL_HOLD:
+            err_r = (ROLL_TARGET_DEG - roll_deg)
+            roll_i = clamp(roll_i + err_r*dt, -50, 50)
+            d_r = (err_r - roll_prev_err)/dt if dt > 0 else 0.0
+            roll_prev_err = err_r
+            roll_pwm = int(TRIM["roll"] + R_KP*err_r + R_KI*roll_i + R_KD*d_r)
+            roll_pwm = clamp(roll_pwm, PWM_MIN, PWM_MAX)
+        else:
+            roll_pwm = TRIM["roll"]
+
+        # ==== ENVIAR RC ====
+        send_rc(master, roll_pwm, TRIM["pitch"], thr_pwm, yaw_pwm)
+
+        # ==== DEAD RECKONING ====
+        v = speed_from_throttle(thr_pwm)
+        # ZUPT: si estamos parados y sin giro, no integres
+        if v == 0.0 and abs(p) < ZUPT_GYRO and abs(q) < ZUPT_GYRO and abs(r) < ZUPT_GYRO:
+            dN = dE = 0.0
+        else:
+            psi = psi_est                            # rad, filtrado
+            the = math.radians(pitch_deg)            # rad
+            v_h = v * math.cos(the)                  # componente horizontal
+            dN = v_h * dt * math.cos(psi)
+            dE = v_h * dt * math.sin(psi)
+
+        N += dN;  E += dE
+
+        # ==== LOG CONSOLA ====
+        print(f"[CTL] wp#{wp_index}  N={N:.2f} E={E:.2f}  dist={dist:.2f}  "
+              f"yaw={yaw_deg_filt:.1f}->{hdg_des:.1f}  err={err_deg:.1f}  "
+              f"roll={roll_deg:.2f}  pitch={pitch_deg:.2f}  PWM yaw={yaw_pwm} thr={thr_pwm}    ", end="\r")
+
+        # ==== LOG CSV ====
+        if csv_writer:
+            csv_writer.writerow([t_now, N, E, dist, yaw_comp, yaw_deg_filt,
+                                 roll_deg, pitch_deg, p, q, r, thr_pwm, yaw_pwm, wp_index])
+
+        # ==== MAPA ====
+        path_N.append(N); path_E.append(E)
+        path_line.set_data(path_E, path_N)
+        pos_marker.set_data([E], [N])
+        ax.relim(); ax.autoscale_view()
+        plt.pause(0.001)
+
+        # Ritmo de control
+        time.sleep(LOOP_DT)
+
+    print("\n[MISSION] Ruta completada. Parando motor.")
+    send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+    time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print("\n[INFO] Interrumpido por usuario.")
+finally:
+    # Seguridad y cierre
+    try:
+        send_rc(master, TRIM["roll"], TRIM["pitch"], 1000, TRIM["yaw"])
+    except Exception:
+        pass
+    if csv_file:
+        csv_file.close()
+        print(f"\n[INFO] Log guardado en: {os.path.abspath(CSV_PATH)}")
+    plt.ioff()
+    plt.show()
